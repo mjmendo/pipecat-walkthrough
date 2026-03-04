@@ -1,0 +1,45 @@
+version: "3.9"
+
+# Pipecat Walkthrough — Observability Stack
+# Start all: docker compose up -d
+# Stop all:  docker compose down
+
+services:
+
+  # ── Jaeger (M5b: OpenTelemetry traces) ──────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    container_name: pipecat-jaeger
+    ports:
+      - "4317:4317"    # OTLP gRPC (from Pipecat → Jaeger)
+      - "16686:16686"  # Jaeger UI
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    restart: unless-stopped
+
+  # ── Prometheus (M5c: metrics scraping) ──────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: pipecat-prometheus
+    ports:
+      - "9090:9090"    # Prometheus UI + query API
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  # ── Grafana (M5c: dashboards) ────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:11.1.0
+    container_name: pipecat-grafana
+    ports:
+      - "3000:3000"    # Grafana UI (admin / admin)
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
