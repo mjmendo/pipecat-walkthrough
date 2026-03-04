@@ -187,16 +187,16 @@ pipecat-walkthrough/
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| M0 | Project Bootstrap | pending |
-| M1 | Local Transport Core Pipeline | pending |
-| M2 | WebSocket + Browser UI | pending |
-| M3 | SmallWebRTC Transport | pending |
-| M4 | Multi-Bot Call Transfer | pending |
-| M5a | Native Metrics Logging | pending |
-| M5b | OpenTelemetry + Jaeger | pending |
-| M5c | Prometheus + Grafana Custom Metrics | pending |
-| M5.5 | Provider Exploration (Swap & Measure) | pending |
-| M6 | RTVI + Observers | pending |
+| M0 | Project Bootstrap | ✅ done |
+| M1 | Local Transport Core Pipeline | ✅ done |
+| M2 | WebSocket + Browser UI | ✅ done |
+| M3 | SmallWebRTC Transport | ✅ done |
+| M4 | Multi-Bot Call Transfer | ✅ done |
+| M5a | Native Metrics Logging | ✅ done |
+| M5b | OpenTelemetry + Jaeger | ✅ done |
+| M5c | Prometheus + Grafana Custom Metrics | ✅ done |
+| M5.5 | Provider Exploration (Swap & Measure) | ✅ done (guide) |
+| M6 | RTVI + Observers | ✅ done |
 
 ---
 
