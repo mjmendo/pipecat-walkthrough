@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pipecat M2 — WebSocket Voice Bot</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 700px;
+      margin: 40px auto;
+      padding: 0 20px;
+      background: #0f0f0f;
+      color: #e0e0e0;
+    }
+    h1 { color: #a78bfa; margin-bottom: 4px; }
+    .subtitle { color: #666; font-size: 0.85em; margin-bottom: 24px; }
+
+    #controls { display: flex; gap: 12px; margin-bottom: 24px; }
+
+    button {
+      padding: 10px 24px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 1em;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    #btn-connect    { background: #7c3aed; color: white; }
+    #btn-disconnect { background: #dc2626; color: white; }
+
+    .panel {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin-bottom: 14px;
+    }
+    .panel-title {
+      font-size: 0.75em;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 8px;
+    }
+
+    #status { color: #fbbf24; }
+    #status.connected { color: #34d399; }
+    #status.error { color: #f87171; }
+
+    #transcript {
+      min-height: 60px;
+      color: #c4b5fd;
+      font-style: italic;
+    }
+    #bot-response {
+      min-height: 60px;
+      color: #a3e635;
+    }
+
+    .log-entry {
+      font-size: 0.8em;
+      color: #555;
+      font-family: monospace;
+    }
+    #debug-log {
+      max-height: 150px;
+      overflow-y: auto;
+    }
+
+    .mic-indicator {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #555;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    .mic-indicator.active { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+  </style>
+</head>
+<body>
+
+<h1>Pipecat Tech Support Bot</h1>
+<p class="subtitle">M2 — WebSocket Transport | Raw PCM → Server → WAV playback</p>
+
+<div id="controls">
+  <button id="btn-connect">Connect</button>
+  <button id="btn-disconnect" disabled>Disconnect</button>
+</div>
+
+<div class="panel">
+  <div class="panel-title">Status</div>
+  <div id="status">Disconnected</div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">
+    <span class="mic-indicator" id="mic-indicator"></span>
+    You said
+  </div>
+  <div id="transcript">—</div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">Bot response</div>
+  <div id="bot-response">—</div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">Debug log (WebSocket frames)</div>
+  <div id="debug-log"></div>
+</div>
+
+<script>
+/**
+ * M2 WebSocket Voice Client
+ *
+ * Learning notes:
+ *
+ * 1. We use the Web Audio API to capture mic at 16kHz (matching Silero VAD requirement).
+ *    ScriptProcessor (deprecated but widely supported) slices audio into 4096-sample chunks.
+ *
+ * 2. Each chunk is sent as raw binary (Float32 → Int16 PCM) over WebSocket.
+ *    The server's RawAudioSerializer wraps these bytes as InputAudioRawFrame.
+ *
+ * 3. Server sends back WAV-wrapped audio chunks (add_wav_header=True).
+ *    We decode each WAV blob and play it through an AudioContext output node.
+ *
+ * 4. Open DevTools → Network → WS to see binary frames flowing.
+ *    Outgoing (green arrows): your mic PCM chunks (every ~256ms)
+ *    Incoming (red arrows): WAV audio chunks from TTS
+ *
+ * What this reveals:
+ * - WebSocket is byte-agnostic; framing is up to the application
+ * - The FrameSerializer (RawAudioSerializer) is the bridge between
+ *   raw bytes and typed Pipecat frames
+ * - Audio is continuous — the pipeline sees InputAudioRawFrame every 256ms
+ *   regardless of whether the user is speaking (VAD filters out silence)
+ */
+
+const WS_URL = "ws://localhost:8765/ws";
+const SAMPLE_RATE = 16000;
+const CHUNK_SIZE = 4096; // samples per ScriptProcessor callback
+
+let ws = null;
+let audioCtx = null;
+let sourceNode = null;
+let processorNode = null;
+let mediaStream = null;
+
+// Queued WAV chunks from server for sequential playback
+let playbackQueue = [];
+let isPlaying = false;
+
+function log(msg) {
+  const el = document.getElementById("debug-log");
+  const entry = document.createElement("div");
+  entry.className = "log-entry";
+  entry.textContent = `${new Date().toLocaleTimeString()} ${msg}`;
+  el.appendChild(entry);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(text, cls = "") {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+
+// Convert Float32Array mic samples → Int16 PCM bytes
+function float32ToInt16(float32) {
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return int16.buffer;
+}
+
+// Play WAV audio blob sequentially (avoid overlap)
+async function enqueueAudio(wavBlob) {
+  playbackQueue.push(wavBlob);
+  if (!isPlaying) drainQueue();
+}
+
+async function drainQueue() {
+  if (playbackQueue.length === 0) { isPlaying = false; return; }
+  isPlaying = true;
+
+  const blob = playbackQueue.shift();
+  const arrayBuffer = await blob.arrayBuffer();
+
+  try {
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+    const source = audioCtx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(audioCtx.destination);
+    source.onended = drainQueue;
+    source.start();
+  } catch (e) {
+    // Empty or corrupt chunk — skip
+    drainQueue();
+  }
+}
+
+document.getElementById("btn-connect").onclick = async () => {
+  document.getElementById("btn-connect").disabled = true;
+
+  try {
+    // Get mic access
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    log("Mic access granted");
+
+    // Create audio context at 16kHz for Silero VAD
+    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    await audioCtx.resume();
+
+    // Connect mic → ScriptProcessor → WebSocket sender
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    processorNode = audioCtx.createScriptProcessor(CHUNK_SIZE, 1, 1);
+
+    processorNode.onaudioprocess = (e) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const samples = e.inputBuffer.getChannelData(0);
+        const pcmBuffer = float32ToInt16(samples);
+        ws.send(pcmBuffer);
+        document.getElementById("mic-indicator").className = "mic-indicator active";
+      }
+    };
+
+    sourceNode.connect(processorNode);
+    processorNode.connect(audioCtx.destination);
+
+    // Open WebSocket
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = "blob";
+
+    ws.onopen = () => {
+      setStatus("Connected — speak to the bot", "connected");
+      document.getElementById("btn-disconnect").disabled = false;
+      log("WebSocket opened");
+    };
+
+    ws.onmessage = async (event) => {
+      if (event.data instanceof Blob) {
+        // Server sends WAV audio chunks
+        const size = event.data.size;
+        log(`← Received WAV chunk (${size} bytes)`);
+        await enqueueAudio(event.data);
+      } else if (typeof event.data === "string") {
+        // Server may send JSON text events (transcription, etc.)
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "transcription") {
+            document.getElementById("transcript").textContent = msg.text;
+            log(`← Transcription: "${msg.text}"`);
+          } else if (msg.type === "bot_response") {
+            document.getElementById("bot-response").textContent = msg.text;
+            log(`← Bot: "${msg.text.slice(0, 60)}..."`);
+          }
+        } catch (_) {
+          log(`← Text: ${event.data.slice(0, 80)}`);
+        }
+      }
+    };
+
+    ws.onerror = (e) => {
+      setStatus("WebSocket error", "error");
+      log(`Error: ${e.message || "unknown"}`);
+    };
+
+    ws.onclose = () => {
+      setStatus("Disconnected");
+      document.getElementById("mic-indicator").className = "mic-indicator";
+      document.getElementById("btn-connect").disabled = false;
+      document.getElementById("btn-disconnect").disabled = true;
+      log("WebSocket closed");
+    };
+
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, "error");
+    document.getElementById("btn-connect").disabled = false;
+    log(`Error: ${err.message}`);
+  }
+};
+
+document.getElementById("btn-disconnect").onclick = () => {
+  if (ws) ws.close();
+  if (sourceNode) sourceNode.disconnect();
+  if (processorNode) processorNode.disconnect();
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  playbackQueue = [];
+  isPlaying = false;
+  log("Disconnected by user");
+};
+</script>
+</body>
+</html>
