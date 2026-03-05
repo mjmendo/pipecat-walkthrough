@@ -16,7 +16,7 @@ Learning note (M2):
     RawAudioSerializer is intentionally minimal for learning.
 """
 
-from pipecat.frames.frames import Frame, InputAudioRawFrame
+from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_transport import TransportParams
 
@@ -38,8 +38,8 @@ class RawAudioSerializer(FrameSerializer):
         self._num_channels = num_channels
 
     async def serialize(self, frame: Frame) -> bytes | str | None:
-        # Output audio is handled by the transport layer (add_wav_header=True)
-        # This method is not called for audio output frames.
+        if isinstance(frame, OutputAudioRawFrame):
+            return frame.audio
         return None
 
     async def deserialize(self, data: bytes | str) -> Frame | None:

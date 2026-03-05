@@ -56,6 +56,12 @@ binary WebSocket message → browser
 
 Without `serializer=RawAudioSerializer(...)` in `FastAPIWebsocketParams`, the input receives bytes but immediately does `continue` — they're silently dropped and the bot never hears you.
 
+Two implementation gotchas in this transport:
+
+1. **`websocket.accept()` is required.** FastAPI/Starlette rejects the WebSocket with 403 if the endpoint doesn't call `await websocket.accept()` before any I/O. `FastAPIWebsocketTransport` does not call it internally — the endpoint handler must.
+
+2. **`serializer.serialize()` is called for output frames too.** `FastAPIWebsocketOutputTransport._write_frame()` calls `serializer.serialize(frame)` for every outgoing frame, including the WAV-wrapped `OutputAudioRawFrame`. If `serialize()` returns `None`, the audio is silently dropped and the browser hears nothing. `RawAudioSerializer.serialize()` must return `frame.audio` for `OutputAudioRawFrame`.
+
 ---
 
 ## Example 3 — Latency Comparison (M1 vs M2)

@@ -36,7 +36,7 @@ from typing import Dict, Optional
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import RedirectResponse
 from loguru import logger
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
@@ -132,7 +132,9 @@ async def run_pizza_bot(
     ]
 
     context = LLMContext(messages)
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    # Keep the pair object (not unpacked) — FlowManager calls .user() and
+    # .assistant() methods on it to access each aggregator.
+    context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
@@ -141,11 +143,11 @@ async def run_pizza_bot(
         [
             transport.input(),
             stt,
-            user_aggregator,
+            context_aggregator.user(),
             llm,
             tts,
             transport.output(),
-            assistant_aggregator,
+            context_aggregator.assistant(),
         ]
     )
 
@@ -163,7 +165,7 @@ async def run_pizza_bot(
     flow_manager = FlowManager(
         task=task,
         llm=llm,
-        context_aggregator=user_aggregator,
+        context_aggregator=context_aggregator,
     )
 
     @transport.event_handler("on_client_disconnected")
@@ -171,13 +173,10 @@ async def run_pizza_bot(
         logger.info("[PIZZA] Client disconnected")
         await task.cancel()
 
-    # Initialize flow with first node and trigger LLM
+    # Initialize flow with first node — this queues LLMRunFrame so the
+    # pizza bot speaks its greeting immediately when the pipeline starts.
     initial_node = _pizza_flows.create_select_size_node(order)
     await flow_manager.initialize(initial_node)
-
-    # Queue initial greeting as TTS (bypasses LLM for immediate delivery)
-    from pipecat.frames.frames import TTSSpeakFrame
-    await task.queue_frames([TTSSpeakFrame(_pizza_persona.INITIAL_MESSAGE)])
 
     runner = PipelineRunner(handle_sigint=False)
     await runner.run(task)
@@ -275,7 +274,13 @@ async def run_tech_support_bot(
             "message": "Transferring you to our pizza service now.",
         })
 
-        # Cancel current pipeline — EndFrame flows through all processors
+        # Keep the WebRTC connection alive through the pipeline transition.
+        # task.cancel() triggers client.disconnect() twice (input + output),
+        # decrementing the leave counter 2→1→0 which closes the connection.
+        # Adding 1 here makes it bottom out at 1 instead, keeping the peer alive.
+        transport._input._client._leave_counter += 1
+
+        # Cancel current pipeline — CancelFrame flows through all processors
         await task.cancel()
 
     llm.register_function("transfer_to_pizza", handle_transfer_to_pizza)
@@ -301,7 +306,21 @@ async def run_tech_support_bot(
     # After tech support pipeline ends, check if transfer was requested
     if transfer_requested:
         logger.info("[TRANSFER] Tech support ended — starting pizza bot")
-        await run_pizza_bot(transport, messages)
+        # Reset initialization flags so the pizza pipeline can restart the
+        # audio receive task on the still-open WebRTC connection.
+        transport._input._initialized = False
+        transport._output._initialized = False
+        # Reset cancellation flag: task.cancel() sets _cancelling=True on all
+        # processors, and queue_frame() silently drops frames when _cancelling
+        # is True. Without this reset the reused transport drops every frame.
+        transport._input._cancelling = False
+        transport._output._cancelling = False
+        try:
+            await run_pizza_bot(transport, messages)
+        except Exception as e:
+            logger.exception(f"[TRANSFER] Pizza bot failed: {e}")
+        finally:
+            await transport._input._client.disconnect()
     else:
         logger.info("[TECH-SUPPORT] Session ended normally")
 
@@ -321,6 +340,24 @@ app.mount("/client", SmallWebRTCPrebuiltUI)
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/client/")
+
+
+@app.post("/start")
+async def start():
+    return {"webrtc_request_params": {"endpoint": "/api/offer"}}
+
+
+@app.patch("/api/offer")
+async def offer_ice(request: Request):
+    data = await request.json()
+    pc_id = data.get("pc_id")
+    candidates = data.get("candidates", [])
+    if not pc_id or pc_id not in pcs_map:
+        return {"status": "unknown_peer"}
+    connection = pcs_map[pc_id]
+    for c in candidates:
+        await connection.add_ice_candidate(c)
+    return {"status": "ok"}
 
 
 @app.post("/api/offer")

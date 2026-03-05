@@ -40,7 +40,8 @@ def create_select_size_node(order: dict) -> NodeConfig:
             {
                 "role": "system",
                 "content": (
-                    "Ask the user what size pizza they want: small, medium, or large. "
+                    "Greet the user and introduce yourself as Marco from Acme Pizza. "
+                    "Then ask what size pizza they want: small, medium, or large. "
                     "Once they specify a size, call select_size with that size."
                 ),
             }

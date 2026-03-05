@@ -38,7 +38,7 @@ from typing import Dict
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import RedirectResponse
 from loguru import logger
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
@@ -180,6 +180,37 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/client/")
+
+
+@app.post("/start")
+async def start():
+    """RTVI-compatible session start endpoint.
+
+    The SmallWebRTCPrebuiltUI calls this first. Returning webrtc_request_params
+    tells the client to use /api/offer directly for WebRTC signaling instead of
+    constructing /sessions/{session_id}/api/offer.
+    """
+    return {"webrtc_request_params": {"endpoint": "/api/offer"}}
+
+
+@app.patch("/api/offer")
+async def offer_ice(request: Request):
+    """Trickle ICE candidate endpoint.
+
+    The prebuilt UI PATCHes ICE candidates here after the initial SDP exchange.
+    """
+    data = await request.json()
+    pc_id = data.get("pc_id")
+    candidates = data.get("candidates", [])
+
+    if not pc_id or pc_id not in pcs_map:
+        return {"status": "unknown_peer"}
+
+    connection = pcs_map[pc_id]
+    for c in candidates:
+        await connection.add_ice_candidate(c)
+
+    return {"status": "ok"}
 
 
 @app.post("/api/offer")

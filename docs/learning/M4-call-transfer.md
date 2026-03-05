@@ -10,9 +10,10 @@ task_ts = PipelineTask(pipeline_ts, ...)
 await task_ts.cancel()
 
 # Pizza pipeline (new task, same transport)
-pipeline_pizza = Pipeline([transport.input(), stt, user_agg_pizza, llm_pizza, tts_shimmer, transport.output(), asst_agg_pizza])
+ctx_agg_pizza = LLMContextAggregatorPair(context, ...)   # keep the pair — don't unpack
+pipeline_pizza = Pipeline([transport.input(), stt, ctx_agg_pizza.user(), llm_pizza, tts_shimmer, transport.output(), ctx_agg_pizza.assistant()])
 task_pizza = PipelineTask(pipeline_pizza, ...)
-flow_manager = FlowManager(task=task_pizza, llm=llm_pizza, context_aggregator=user_agg_pizza)
+flow_manager = FlowManager(task=task_pizza, llm=llm_pizza, context_aggregator=ctx_agg_pizza)
 await flow_manager.initialize(create_select_size_node(order))
 ```
 
@@ -145,3 +146,86 @@ The summary extracts signal from the conversation without the token cost of the 
 Full context hand-off vs summary is a trade-off:
 - **Full context**: pizza bot has complete conversation history, but more tokens, more context pollution
 - **Summary**: cheaper, focused, but lossy (fine for most use cases)
+
+---
+
+## Implementation Gotchas
+
+Five non-obvious issues when reusing a SmallWebRTC transport across two pipeline tasks:
+
+### 1. Signaling endpoints (same as M3)
+
+`SmallWebRTCPrebuiltUI` requires both `POST /start` and `PATCH /api/offer` — identical to M3. See M3 guide.
+
+### 2. System prompt must say "call the function"
+
+The LLM will not call a function tool unless the prompt explicitly says so. This does not work:
+
+```
+If the user asks about pizza, let them know you can transfer them.
+```
+
+The LLM verbally describes the transfer but never calls it. This does:
+
+```
+If the user asks about pizza, call the transfer_to_pizza function immediately.
+```
+
+### 3. `_leave_counter` — keeping the WebRTC connection alive
+
+`SmallWebRTCClient` uses a reference counter (`_leave_counter`) to decide when to actually close the connection. Each transport (input + output) increments it during `setup()` and decrements it during `disconnect()`. When the counter hits 0, the peer connection is closed.
+
+`task.cancel()` triggers `cancel()` on both transports → two `disconnect()` calls → counter goes 2→1→0 → connection closes before the pizza bot starts.
+
+Fix: increment the counter by 1 before cancelling so it bottoms out at 1, not 0:
+
+```python
+transport._input._client._leave_counter += 1
+await task.cancel()
+```
+
+### 4. `_initialized` — allowing the transport to restart
+
+Both `SmallWebRTCInputTransport` and `SmallWebRTCOutputTransport` guard their `start()` with an `_initialized` flag. Once set, `start()` is a no-op — the audio receive task is never recreated. Reset both before starting the pizza pipeline:
+
+```python
+transport._input._initialized = False
+transport._output._initialized = False
+```
+
+### 5. `_cancelling` — the silent frame-dropper
+
+`task.cancel()` sets `_cancelling = True` on **every processor** in the pipeline, including the reused transport processors. `FrameProcessor.queue_frame()` checks this flag and silently drops all frames when it is set:
+
+```python
+if self._cancelling:
+    return
+```
+
+The pizza pipeline starts, the runner runs, but every frame the pipeline tries to process is dropped before it reaches the LLM or TTS. The bot is alive but deaf and mute. Reset both transports:
+
+```python
+transport._input._cancelling = False
+transport._output._cancelling = False
+```
+
+This is the hardest bug to find: no exception, no error log — just silence.
+
+### 6. `LLMContextAggregatorPair` — pass the pair, not the user aggregator
+
+`FlowManager` calls `context_aggregator.user()` and `context_aggregator.assistant()` as methods. If you unpack the pair and pass only the user aggregator, every flow transition crashes with:
+
+```
+'LLMUserAggregator' object has no attribute 'assistant'
+```
+
+Keep the pair object:
+```python
+# Wrong
+user_agg, asst_agg = LLMContextAggregatorPair(context, ...)
+FlowManager(..., context_aggregator=user_agg)   # ← crashes on transition
+
+# Correct
+ctx_agg = LLMContextAggregatorPair(context, ...)
+FlowManager(..., context_aggregator=ctx_agg)    # ← .user() and .assistant() available
+```

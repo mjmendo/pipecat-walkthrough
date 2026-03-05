@@ -89,6 +89,7 @@ async def websocket_endpoint(websocket: WebSocket):
     clicks the mic button, and closing it when done.
     """
     logger.info("New WebSocket connection")
+    await websocket.accept()
 
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
