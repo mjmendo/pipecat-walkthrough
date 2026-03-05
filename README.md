@@ -2,17 +2,88 @@
 
 A hands-on learning project building a **multi-persona AI voice call center** with [Pipecat](https://github.com/pipecat-ai/pipecat). Two bots — tech support and pizza ordering — run on a shared WebRTC connection and can transfer calls between each other, with full observability (traces, metrics, dashboards).
 
-## What's inside
+---
+
+## Start here
+
+### 1. Clone Pipecat as a sibling directory
+
+This project runs Pipecat from source (required — the pip package is behind).
+
+```bash
+cd ~/dev   # or wherever this repo lives
+git clone https://github.com/pipecat-ai/pipecat.git
+# Result: ~/dev/pipecat  ← sibling of ~/dev/pipecat-walkthrough
+```
+
+### 2. Install system dependencies
+
+```bash
+brew install portaudio   # required for M1 mic/speaker audio
+```
+
+### 3. Create a virtual environment and install
+
+```bash
+cd pipecat-walkthrough
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[observability]"
+```
+
+### 4. Add your API key
+
+```bash
+cp .env.example .env
+# Edit .env and set OPENAI_API_KEY=sk-...
+```
+
+### 5. Run M1 — your first voice bot
+
+```bash
+python bots/tech-support/local_bot.py
+# Speak into your mic. The bot responds as Alex, a tech support agent.
+# Press Ctrl+C to quit.
+```
+
+Then open `docs/learning/M1-core-pipeline.md` and work through its 5 examples to understand what just happened inside the pipeline.
+
+---
+
+## Milestones — run in order
+
+Each milestone adds one layer. The bot core (STT → LLM → TTS) never changes — only the transport and observability wrappers grow.
+
+| # | Run this | Then read |
+|---|----------|-----------|
+| M1 | `python bots/tech-support/local_bot.py` | `docs/learning/M1-core-pipeline.md` |
+| M2 | `python bots/tech-support/ws_server.py` → open `frontend/websocket.html` | `docs/learning/M2-websocket.md` |
+| M3 | `python bots/tech-support/webrtc_server.py` → open `http://localhost:7860` | `docs/learning/M3-webrtc.md` |
+| M4 | `python bots/tech-support/transfer_server.py` → open `http://localhost:7860` | `docs/learning/M4-call-transfer.md` |
+| M5 | `./scripts/start-infra.sh` then `python bots/tech-support/observability_server.py` | `docs/learning/M5-observability.md` |
+| M5.5 | (modify `observability_server.py` per guide, keep Grafana open) | `docs/learning/M5.5-providers.md` |
+| M6 | `python bots/tech-support/rtvi_server.py` → open `http://localhost:7860` | `docs/learning/M6-rtvi-observers.md` |
+
+**M5 requires Docker** for Jaeger + Prometheus + Grafana. Run `./scripts/start-infra.sh` once — it starts all three. Dashboards:
+
+- Jaeger (traces): http://localhost:16686
+- Grafana (metrics): http://localhost:3000 — login: `admin / admin`
+- Prometheus: http://localhost:9090
+
+---
+
+## What each milestone teaches
 
 | Milestone | What it builds | Key concepts |
-|-----------|---------------|--------------|
+|-----------|----------------|--------------|
 | M1 — Local Pipeline | Voice bot via mic/speaker | Frame types, VAD, STT→LLM→TTS, MetricsFrame |
 | M2 — WebSocket | Same bot from a browser tab | FrameSerializer, WebSocket transport |
 | M3 — WebRTC | WebRTC audio via aiortc | SmallWebRTCTransport, SDP signaling, OPUS codec |
-| M4 — Call Transfer | Two personas, one connection | Function calling, pipeline restart, pipecat-flows state machine |
-| M5 — Observability | Logs + traces + Grafana | BaseObserver, OpenTelemetry/Jaeger, Prometheus, custom metrics |
-| M5.5 — Providers | Swap STT/LLM/TTS, measure impact | Deepgram, Ollama, Cartesia, Whisper.cpp, Coqui |
+| M4 — Call Transfer | Two personas, one connection | Function calling, pipeline restart, pipecat-flows |
+| M5 — Observability | Logs + traces + Grafana | BaseObserver, OpenTelemetry/Jaeger, Prometheus |
+| M5.5 — Providers | Swap STT/LLM/TTS, measure TTFB | Deepgram, Ollama, Cartesia, Whisper.cpp, Coqui |
 | M6 — RTVI | Structured browser events | RTVIProcessor, RTVIObserver, custom server messages |
+
+---
 
 ## Project structure
 
@@ -20,75 +91,17 @@ A hands-on learning project building a **multi-persona AI voice call center** wi
 pipecat-walkthrough/
 ├── bots/
 │   ├── shared/          # Observers, context utils, debug tools
-│   ├── tech-support/    # Alex persona — local, WebSocket, WebRTC, RTVI servers
+│   ├── tech-support/    # Alex persona — one server per milestone
 │   └── pizza/           # Marco persona — pipecat-flows ordering state machine
 ├── docs/
 │   ├── learning/        # Per-milestone Do/Observe/Understand guides
-│   └── *.md             # Architecture and component reference docs
+│   └── *.md             # Architecture and component reference
 ├── frontend/            # Browser clients (WebSocket + WebRTC)
 ├── infra/               # Docker Compose: Jaeger + Prometheus + Grafana
 └── scripts/             # start-infra.sh
 ```
 
-## Prerequisites
+## Reference docs
 
-- Python 3.11+
-- OpenAI API key
-- Docker (for M5 observability stack)
-- `portaudio` (for M1 local audio): `brew install portaudio`
-
-```bash
-cp .env.example .env
-# add OPENAI_API_KEY to .env
-
-pip install -e ".[observability]"
-```
-
-> This project installs Pipecat from a local source checkout at `../pipecat`. Clone [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) as a sibling directory first.
-
-## Running each milestone
-
-```bash
-# M1 — terminal voice bot
-python bots/tech-support/local_bot.py
-
-# M2 — WebSocket browser client
-uvicorn bots.tech-support.ws_server:app --port 8765
-open frontend/websocket.html
-
-# M3 — WebRTC (prebuilt browser UI)
-python bots/tech-support/webrtc_server.py
-# open http://localhost:7860
-
-# M4 — multi-bot call transfer
-python bots/tech-support/transfer_server.py
-# open http://localhost:7860
-
-# M5 — full observability stack
-./scripts/start-infra.sh
-python bots/tech-support/observability_server.py
-# Jaeger:    http://localhost:16686
-# Grafana:   http://localhost:3000  (admin/admin)
-# Prometheus: http://localhost:9090
-
-# M6 — RTVI protocol + observers
-python bots/tech-support/rtvi_server.py
-# open http://localhost:7860
-```
-
-## Learning guides
-
-Each milestone has a guide in `docs/learning/` following a **Do / Observe / Understand** format — run the bot, observe the output, then read the explanation of what Pipecat did internally.
-
-- `M1-core-pipeline.md` — frame flow, interruptions, metrics, graceful shutdown
-- `M2-websocket.md` — serializer, latency comparison vs local
-- `M3-webrtc.md` — OPUS codec, ICE/DTLS, audio quality vs WebSocket
-- `M4-call-transfer.md` — function calling, context hand-off, pipecat-flows
-- `M5-observability.md` — MetricsFrame, OTel spans, Prometheus counters, Grafana
-- `M5.5-providers.md` — provider swap guide with TTFB measurement context
-- `M6-rtvi-observers.md` — RTVI events, observer vs processor latency tradeoff
-
-## Architecture docs
-
-- `docs/01-architecture.md` — system overview and component map
-- `docs/02-local-transport.md` through `docs/07-rtvi-observers.md` — per-milestone reference
+- `docs/01-architecture.md` — full system overview and component map
+- `docs/02-local-transport.md` through `docs/07-rtvi-observers.md` — per-milestone deep-dives
