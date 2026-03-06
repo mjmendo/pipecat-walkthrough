@@ -167,16 +167,16 @@ async def run_pizza_bot(transport, tech_support_messages: list) -> None:
         {"role": "system", "content": transfer_summary},
     ]
     context = LLMContext(messages)
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
-    pipeline = Pipeline([transport.input(), stt, user_aggregator, llm, tts, transport.output(), assistant_aggregator])
+    pipeline = Pipeline([transport.input(), stt, context_aggregator.user(), llm, tts, transport.output(), context_aggregator.assistant()])
     task = PipelineTask(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True), observers=_make_observers())
 
     order = {}
-    flow_manager = FlowManager(task=task, llm=llm, context_aggregator=user_aggregator)
+    flow_manager = FlowManager(task=task, llm=llm, context_aggregator=context_aggregator)
 
     @transport.event_handler("on_client_disconnected")
     async def on_disc(transport, client):
@@ -184,9 +184,6 @@ async def run_pizza_bot(transport, tech_support_messages: list) -> None:
 
     initial_node = _pizza_flows.create_select_size_node(order)
     await flow_manager.initialize(initial_node)
-
-    from pipecat.frames.frames import TTSSpeakFrame
-    await task.queue_frames([TTSSpeakFrame(_pizza_persona.INITIAL_MESSAGE)])
 
     runner = PipelineRunner(handle_sigint=False)
     await runner.run(task)
@@ -228,6 +225,7 @@ async def run_tech_support_bot(webrtc_connection: SmallWebRTCConnection) -> None
         # Record transfer in Prometheus
         PrometheusMetricsObserver.record_transfer()
         await params.result_callback({"status": "transferring", "message": "Transferring you now."})
+        transport._input._client._leave_counter += 1
         await task.cancel()
 
     llm.register_function("transfer_to_pizza", handle_transfer_to_pizza)
@@ -246,7 +244,18 @@ async def run_tech_support_bot(webrtc_connection: SmallWebRTCConnection) -> None
     await runner.run(task)
 
     if transfer_requested:
-        await run_pizza_bot(transport, messages)
+        transport._input._initialized = False
+        transport._output._initialized = False
+        transport._input._cancelling = False
+        transport._output._cancelling = False
+        try:
+            await run_pizza_bot(transport, messages)
+        except Exception as e:
+            logger.exception(f"[TRANSFER] Pizza bot failed: {e}")
+        finally:
+            await transport._input._client.disconnect()
+    else:
+        logger.info("[TECH-SUPPORT] Session ended normally")
 
 
 @asynccontextmanager
@@ -266,6 +275,23 @@ app.mount("/client", SmallWebRTCPrebuiltUI)
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/client/")
+
+
+@app.post("/start")
+async def start():
+    return {"webrtc_request_params": {"endpoint": "/api/offer"}}
+
+
+@app.patch("/api/offer")
+async def offer_ice(request: dict):
+    pc_id = request.get("pc_id")
+    candidates = request.get("candidates", [])
+    if not pc_id or pc_id not in pcs_map:
+        return {"status": "unknown_peer"}
+    connection = pcs_map[pc_id]
+    for c in candidates:
+        await connection.add_ice_candidate(c)
+    return {"status": "ok"}
 
 
 @app.post("/api/offer")
