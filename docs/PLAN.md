@@ -183,6 +183,82 @@ pipecat-walkthrough/
 
 ---
 
+### M7 — Voice Agent Guardrails
+**Goal:** Safety and compliance as first-class Pipecat primitives.
+- `bots/shared/guardrails.py`: `ContentSafetyGuard` (OpenAI Moderation API, free, async mode), `TopicGuard` (gpt-4o-mini YES/NO classifier), `PIIRedactGuard` (regex, zero latency), `GuardrailAuditObserver` (out-of-path event collector)
+- `bots/tech-support/guardrails_server.py`: extends `rtvi_server.py` with all three guards + M4 pizza transfer on off-topic
+- **What this teaches:** guards as FrameProcessors (gate/transform), audit as BaseObserver (zero latency). Async mode hides guard latency behind LLM TTFB. Guard ordering = cheapest rejection first.
+- Document: `docs/learning/M7-guardrails.md`
+- Research: `docs/researches/AI Voice Guardrails Report.md`
+- **Commit**
+
+---
+
+### M8 — Working Memory (Context Compression + Fact Extraction)
+**Goal:** In-session memory — prevent context-window overflow and persist facts across turns within a call.
+
+- **New file: `bots/shared/working_memory.py`**
+  - `ConversationSummaryProcessor(FrameProcessor)`: intercepts `LLMMessagesFrame` between `user_agg` and `llm`. When message count > `compress_threshold` (default 10), calls `gpt-4o-mini` to summarize old messages and replaces them with a single compact system message. Adds ~150-300ms latency on the compression turn only.
+  - `FactExtractionObserver(BaseObserver)`: watches `LLMFullResponseEndFrame` out-of-path. After each assistant turn, extracts structured facts (device, OS, error, steps tried) from the last exchange via `gpt-4o-mini` and injects them into `LLMContext` at `facts_slot_index=1`. Zero pipeline latency.
+
+- **New file: `bots/tech-support/memory_server.py`** — extends `guardrails_server.py` (M7):
+  - `ConversationSummaryProcessor` between `user_agg` and `llm`
+  - `FactExtractionObserver` in the observers list
+
+- **Pipeline diff (M7 → M8):**
+  ```
+  ..., user_agg,
+  + ConversationSummaryProcessor(compress_threshold=10),   # M8a
+  llm, ...
+
+  observers=[..., FactExtractionObserver(context, api_key)]  # M8b
+  ```
+
+- **What this teaches:** `LLMMessagesFrame` anatomy; compression as a frame transformation (in-path); fact extraction as an out-of-path observer that writes back into shared `LLMContext`; token cost economics over long calls; when to pay ~200ms latency vs hide it.
+- Document: `docs/learning/M8-working-memory.md`
+- Research: `docs/researches/ai-agent-memory-2026.md`, `docs/researches/M8-M9-memory-plan.md`
+- **Commit**
+
+---
+
+### M9 — Semantic Memory with Vector Search (Episodic Recall)
+**Goal:** Cross-session episodic memory — bot recalls relevant past conversations via vector similarity.
+
+- **New dependency:** `chromadb>=0.5.0` (local, no account, no Docker)
+
+- **New file: `bots/shared/vector_memory.py`**
+  - `EpisodicMemoryStore`: wraps `chromadb.PersistentClient`. Stores conversation summaries with OpenAI `text-embedding-3-small` embeddings. Methods: `store(session_id, summary, metadata)`, `retrieve(query_text, top_k=3, threshold=0.75)`, `evict_older_than(days=30)`.
+  - `SemanticMemoryRetriever(FrameProcessor)`: on each `TranscriptionFrame`, embeds the user utterance (~100ms inline), retrieves top-k similar past episodes, injects them as `context.messages[2]` system message. Always forwards the frame.
+  - `EpisodicMemoryWriter(BaseObserver)`: watches `EndFrame` out-of-path. Summarizes the full session with `gpt-4o-mini`, embeds it, persists to ChromaDB. ~300ms total, runs after session ends (no user impact).
+
+- **New file: `bots/tech-support/semantic_memory_server.py`** — extends `memory_server.py` (M8):
+  - `SemanticMemoryRetriever` after `PIIRedactGuard(input)`, before `user_agg`
+  - `EpisodicMemoryWriter` in observers list
+
+- **Context slot layout after M9:**
+  | Index | Content | Written by |
+  |-------|---------|-----------|
+  | 0 | Persona system prompt | `persona.py` (once) |
+  | 1 | Known facts (device, OS, error) | `FactExtractionObserver` (each turn) |
+  | 2 | Retrieved past episodes | `SemanticMemoryRetriever` (each turn) |
+  | 3+ | Conversation history | `LLMContextAggregatorPair` (compressed by M8a) |
+
+- **Pipeline diff (M8 → M9):**
+  ```
+  ..., PIIRedactGuard(mode="input"),
+  + SemanticMemoryRetriever(store, context, memory_slot_index=2),  # M9a
+  user_agg, ConversationSummaryProcessor, llm, ...
+
+  observers=[..., EpisodicMemoryWriter(store, context, session_id)]  # M9b
+  ```
+
+- **What this teaches:** episodic vs semantic memory; why vector search beats keyword search for voice (paraphrase invariance); embedding latency budget (inline ~100ms vs async); cosine similarity threshold tuning; memory decay and eviction; multi-user isolation via metadata filters.
+- **Gitignore:** add `.chroma/`
+- Document: `docs/learning/M9-semantic-memory.md`
+- **Commit**
+
+---
+
 ## Task Tracking
 
 | # | Milestone | Status |
@@ -197,6 +273,9 @@ pipecat-walkthrough/
 | M5c | Prometheus + Grafana Custom Metrics | ✅ done |
 | M5.5 | Provider Exploration (Swap & Measure) | ✅ done (guide) |
 | M6 | RTVI + Observers | ✅ done |
+| M7 | Voice Agent Guardrails | ✅ done |
+| M8 | Working Memory (Compression + Fact Extraction) | ⬜ planned |
+| M9 | Semantic Memory (ChromaDB + Episodic Recall) | ⬜ planned |
 
 ---
 
@@ -345,6 +424,34 @@ Same stem, same conversation scenarios. Now with WebRTC. Compare to M2.
 | 2 | Transfer notification in UI | Trigger call transfer | Browser shows "Transferring to pizza bot…" notification. | Custom RTVI message sent at transfer point. Client's `on(RTVIEvent.Custom)` handler receives it. |
 | 3 | Write a debug observer | Implement `BaseObserver.on_push_frame()` that logs every frame type | Stdout shows every frame, processor name, and direction. | Observers are non-intrusive pipeline taps. They can't block frames. |
 | 4 | Compare observer vs processor | Move debug logger into a FrameProcessor | Logger adds latency. Observer version: zero latency. | Observers run in their own async task. Only add logic to the frame path when you need to transform frames. |
+
+---
+
+### M8 Learning Guide — Working Memory
+
+**File:** `docs/learning/M8-working-memory.md`
+
+| # | Example | Do | Observe | Understand |
+|---|---------|-----|---------|------------|
+| 1 | Fact injection | Say "My MacBook Pro running macOS Ventura shows a kernel panic". Ask a follow-up. | Second turn: `[MEMORY] FactExtractionObserver updated facts: {device: MacBook Pro, os: macOS Ventura, error: kernel panic}`. Next LLM call has facts at `messages[1]`. | `FactExtractionObserver` runs after `LLMFullResponseEndFrame` — out of path, zero frame latency. Writes directly into shared `LLMContext`. |
+| 2 | Compression triggers | Have 11+ exchanges rapidly. Watch logs at turn 10. | `[MEMORY] ConversationSummaryProcessor: compressing 10 messages → 3`. Next `LLMMessagesFrame` has 3 messages. | In-path processor adds ~200ms on compression turn. All other turns: unchanged. |
+| 3 | Token cost over long calls | Log `MetricsFrame` prompt tokens at turns 5, 10, 15 vs M7 baseline. | M7: linear growth. M8: spike at compression, then drops back to near-baseline. | Cost of one gpt-4o-mini compression (~$0.0002) pays back in ~3 turns saved. |
+| 4 | Compression latency on TTFB | Watch Grafana TTFB histogram on compression turn vs adjacent turns. | ~200ms TTFB spike on compression turn. All others: identical to M7. | Processors add latency synchronously — only pay it when needed. |
+| 5 | Fact persistence across topic changes | Establish device facts, then ask about Wi-Fi, then "what laptop do I have?" | Bot correctly states device from facts message, regardless of intervening turns. | `FactExtractionObserver` accumulates facts into a dict — new values overwrite old, unknown keys append. |
+
+---
+
+### M9 Learning Guide — Semantic Memory
+
+**File:** `docs/learning/M9-semantic-memory.md`
+
+| # | Example | Do | Observe | Understand |
+|---|---------|-----|---------|------------|
+| 1 | First session — cold start | Fresh `.chroma/` directory. Say "My MacBook has kernel panic on startup". Disconnect. | No retrieved episodes. On `EndFrame`: `[MEMORY] EpisodicMemoryWriter storing episode`. `.chroma/` directory created. | Writer runs on `EndFrame` — after session ends, no user impact. First session always cold-starts. |
+| 2 | Second session — semantic recall | New session. Say "My laptop crashes before the login screen". | `[MEMORY] SemanticMemoryRetriever: retrieved 1 episode (score=0.83)`. LLM context has past episode injected. Bot references previous call. | "crashes before login" and "kernel panic on startup" have no keyword overlap but score 0.83 cosine similarity. Vector search retrieves what keyword search misses. |
+| 3 | Embedding latency (inline vs async) | Compare STT TTFB in M8 vs M9 via MetricsFrame logs. | M8: ~320ms. M9: ~420ms (+100ms embedding call). | `SemanticMemoryRetriever` awaits the embedding inline — stalls the frame path ~100ms. Acceptable when hidden inside STT TTFB. See guide for async alternative tradeoffs. |
+| 4 | Threshold tuning | Build 5-episode store, ask "connection dropping". Try threshold 0.5, 0.75, 0.9. | 0.5: false positives. 0.75: correct. 0.9: nothing returned. | Cosine similarity sweet spot for tech support voice: 0.75-0.85. Tune per domain by examining `similarity_score` logs on real queries. |
+| 5 | Memory decay + multi-user isolation | Call `store.evict_older_than(days=0)`. Then add `user_id` filter to metadata. | After eviction: next session cold-starts. With `user_id`: user A episodes don't appear for user B. | ChromaDB metadata filters: `where={"user_id": "alice"}`. Decay is manual — query by timestamp, delete by ID. One-line change for isolation. |
 
 ---
 

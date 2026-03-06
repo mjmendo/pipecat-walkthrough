@@ -32,3 +32,6 @@ node_modules/
 # Pipecat model cache (Silero VAD)
 *.onnx
 *.onnx.data
+
+# M9 — ChromaDB local vector store
+.chroma/

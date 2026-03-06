@@ -17,6 +17,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+memory = [
+    "chromadb>=0.5.0",
+    # openai already present — text-embedding-3-small uses the same client
+]
 observability = [
     "opentelemetry-api>=1.25.0",
     "opentelemetry-sdk>=1.25.0",
