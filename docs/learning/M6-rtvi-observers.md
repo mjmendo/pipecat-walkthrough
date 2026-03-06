@@ -1,5 +1,23 @@
 # M6 Learning Guide — RTVI Protocol + Observers
 
+## What is RTVI?
+
+Every milestone so far used the prebuilt browser UI — but the browser only received raw audio. It had no idea whether the bot was speaking, what words were being said, or when a call transfer happened. It was a black box.
+
+**RTVI (Real-Time Voice Infrastructure)** is the protocol that fixes this. It defines a structured event layer between the Pipecat pipeline and any browser client, so the UI can react to pipeline state in real time — speaking indicators, live transcripts, custom notifications — without polling or guessing.
+
+RTVI has two sides:
+
+**Server side (Python):** Two components are added to the pipeline.
+- `RTVIProcessor` — a `FrameProcessor` placed in the frame path (after TTS, before transport output). It handles incoming RTVI messages from the browser (e.g. config updates, action requests) and provides the `send_server_message()` method for pushing custom events to the client.
+- `RTVIObserver` — a `BaseObserver` (non-intrusive tap). It watches the frame stream and converts pipeline frames into RTVI events that the browser understands: `BotStartedSpeakingFrame` → speaking indicator on; `TTSTextFrame` → bot transcript word; `TranscriptionFrame` → user transcript word.
+
+**Client side (JavaScript):** The prebuilt UI (`@pipecat-ai/client-js`) already speaks RTVI. Once `RTVIObserver` is active on the server, the browser automatically receives and renders speaking indicators, transcripts, and any custom messages you send.
+
+The key distinction: `RTVIProcessor` is **in the frame path** (adds latency, required for incoming client messages). `RTVIObserver` is **out of the frame path** (zero latency, watches outgoing frames). You need both.
+
+---
+
 ## The Stem (M4 + RTVI additions)
 
 ```python
